@@ -16,9 +16,6 @@ from time import time
 
 import pyhdb
 
-DatabaseError = Database.DatabaseError
-IntegrityError = Database.IntegrityError
-
 logger = logging.getLogger('django.db.backends')
 
 
