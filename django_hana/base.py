@@ -141,6 +141,8 @@ class DatabaseWrapper(BaseDatabaseWrapper):
     def __init__(self, *args, **kwargs):
         super(DatabaseWrapper, self).__init__(*args, **kwargs)
 
+        self.settings_dict['ENGINE'] = 'mysql'
+
         self.features = DatabaseFeatures(self)
 
         self.ops = DatabaseOperations(self)
