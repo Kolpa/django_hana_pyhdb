@@ -71,9 +71,11 @@ class CursorWrapper(object):
         pass
 
     def execute(self, sql, params=()):
+        print(sql)
         self.cursor.execute(sql, params)
 
     def executemany(self, sql, param_list):
+        print(sql)
         self.cursor.executemany(sql, param_list)
 
 
