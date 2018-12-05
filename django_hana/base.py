@@ -14,16 +14,13 @@ from django_hana.introspection import DatabaseIntrospection
 from django.utils.timezone import utc
 from time import time
 
-try:
-    from hdbcli import dbapi as Database
-except ImportError as e:
-    from django.core.exceptions import ImproperlyConfigured
-    raise ImproperlyConfigured("Error loading SAP HANA Python driver: %s" % e)
+import pyhdb
 
 DatabaseError = Database.DatabaseError
 IntegrityError = Database.IntegrityError
 
 logger = logging.getLogger('django.db.backends')
+
 
 class DatabaseFeatures(BaseDatabaseFeatures):
     needs_datetime_string_cast = True
@@ -56,7 +53,7 @@ class CursorWrapper(object):
         self.is_hana = True
 
     def set_dirty(self):
-        if self.db.is_managed():
+        if not self.db.get_autocommit():
             self.db.set_dirty()
 
     def __getattr__(self, attr):
@@ -69,39 +66,18 @@ class CursorWrapper(object):
     def __iter__(self):
         return iter(self.cursor)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        # self.cursor.close()
+        pass
 
     def execute(self, sql, params=()):
-        """
-            execute with replaced placeholders
-        """
-        try:
-            self.cursor.execute(self._replace_params(sql,len(params) if params else 0),params)
-        except Database.IntegrityError as e:
-            six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
-        except Database.Error as e:
-            # Map some error codes to IntegrityError, since they seem to be
-            # misclassified and Django would prefer the more logical place.
-            if e[0] in self.codes_for_integrityerror:
-                six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
-            six.reraise(utils.DatabaseError, utils.DatabaseError(*tuple(e.args)), sys.exc_info()[2])
+        self.cursor.execute(sql, params)
 
     def executemany(self, sql, param_list):
-        try:
-            self.cursor.executemany(self._replace_params(sql,len(param_list[0]) if param_list and len(param_list)>0 else 0),param_list)
-        except Database.IntegrityError as e:
-            six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
-        except Database.Error as e:
-            # Map some error codes to IntegrityError, since they seem to be
-            # misclassified and Django would prefer the more logical place.
-            if e[0] in self.codes_for_integrityerror:
-                six.reraise(utils.IntegrityError, utils.IntegrityError(*tuple(e.args)), sys.exc_info()[2])
-            six.reraise(utils.DatabaseError, utils.DatabaseError(*tuple(e.args)), sys.exc_info()[2])
-
-    def _replace_params(self,sql,params_count):
-        """
-        converts %s style placeholders to ?
-        """
-        return sql % tuple('?'*params_count)
+        self.cursor.executemany(sql, param_list)
 
 
 class CursorDebugWrapper(CursorWrapper):
@@ -110,7 +86,7 @@ class CursorDebugWrapper(CursorWrapper):
         self.set_dirty()
         start = time()
         try:
-            return CursorWrapper.execute(self,sql, params)
+            return CursorWrapper.execute(self, sql, params)
         finally:
             stop = time()
             duration = stop - start
@@ -120,14 +96,15 @@ class CursorDebugWrapper(CursorWrapper):
                 'time': "%.3f" % duration,
             })
             logger.debug('(%.3f) %s; args=%s' % (duration, sql, params),
-                extra={'duration': duration, 'sql': sql, 'params': params}
-            )
+                         extra={'duration': duration,
+                                'sql': sql, 'params': params}
+                         )
 
     def executemany(self, sql, param_list):
         self.set_dirty()
         start = time()
         try:
-            return CursorWrapper.executemany(self,sql, param_list)
+            return CursorWrapper.executemany(self, sql, param_list)
         finally:
             stop = time()
             duration = stop - start
@@ -140,8 +117,9 @@ class CursorDebugWrapper(CursorWrapper):
                 'time': "%.3f" % duration,
             })
             logger.debug('(%.3f) %s; args=%s' % (duration, sql, param_list),
-                extra={'duration': duration, 'sql': sql, 'params': param_list}
-            )
+                         extra={'duration': duration,
+                                'sql': sql, 'params': param_list}
+                         )
 
 
 class DatabaseWrapper(BaseDatabaseWrapper):
@@ -178,19 +156,8 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         self.validate_thread_sharing()
         if self.connection is None:
             return
-        try:
-            self.connection.close()
-            self.connection = None
-        except Database.Error:
-            # In some cases (database restart, network connection lost etc...)
-            # the connection to the database is lost without giving Django a
-            # notification. If we don't set self.connection to None, the error
-            # will occur a every request.
-            self.connection = None
-            logger.warning('saphana error while closing the connection.',
-                exc_info=sys.exc_info()
-            )
-            raise
+        self.connection.close()
+        self.connection = None
 
     def connect(self):
         if not self.settings_dict['NAME']:
@@ -207,12 +174,17 @@ class DatabaseWrapper(BaseDatabaseWrapper):
             conn_params['host'] = self.settings_dict['HOST']
         if self.settings_dict['PORT']:
             conn_params['port'] = self.settings_dict['PORT']
-        self.connection = Database.connect(address=conn_params['host'],port=int(conn_params['port']),user=conn_params['user'],password=conn_params['password'])
+        self.connection = pyhdb.connect(
+            host=conn_params['host'],
+            port=int(conn_params['port']),
+            user=conn_params['user'],
+            password=conn_params['password']
+        )
         # set autocommit on by default
         self.connection.setautocommit(auto=True)
-        self.default_schema=self.settings_dict['NAME']
+        self.default_schema = self.settings_dict['NAME']
         # make it upper case
-        self.default_schema=self.default_schema.upper()
+        self.default_schema = self.default_schema.upper()
         self.create_or_set_default_schema()
 
     def _cursor(self):
@@ -227,8 +199,8 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         # Call parent, in order to support cursor overriding from apps like Django Debug Toolbar
         # self.BaseDatabaseWrapper API is very asymetrical here - uses make_debug_cursor() for the
         # debug cursor, but directly instantiates urils.CursorWrapper for the regular one
-        result = super (DatabaseWrapper, self).cursor ()
-        if getattr(result,'is_hana',False):
+        result = super(DatabaseWrapper, self).cursor()
+        if getattr(result, 'is_hana', False):
             cursor = result
         else:
             cursor = CursorWrapper(self._cursor(), self)
@@ -237,14 +209,14 @@ class DatabaseWrapper(BaseDatabaseWrapper):
     def make_debug_cursor(self, cursor):
         return CursorDebugWrapper(cursor, self)
 
-
     def create_or_set_default_schema(self):
         """
             create if doesn't exist and then make it default
         """
         cursor = self.cursor()
-        cursor.execute("select (1) as a from schemas where schema_name='%s'" % self.default_schema)
-        res=cursor.fetchone()
+        cursor.execute(
+            "select (1) as a from schemas where schema_name='%s'" % self.default_schema)
+        res = cursor.fetchone()
         if not res:
             cursor.execute("create schema %s" % self.default_schema)
         cursor.execute("set schema "+self.default_schema)
@@ -266,11 +238,11 @@ class DatabaseWrapper(BaseDatabaseWrapper):
                 del self.transaction_state[-1]
             else:
                 raise TransactionManagementError("This code isn't under transaction "
-                    "management")
+                                                 "management")
             if self._dirty:
                 self.rollback()
                 raise TransactionManagementError("Transaction managed block ended with "
-                    "pending COMMIT/ROLLBACK")
+                                                 "pending COMMIT/ROLLBACK")
         except:
             raise
         finally:
@@ -280,8 +252,4 @@ class DatabaseWrapper(BaseDatabaseWrapper):
 
     def _commit(self):
         if self.connection is not None:
-            try:
-                return self.connection.commit()
-            except Database.IntegrityError as e:
-                ### TODO: reraise instead of raise - six.reraise was deleted due to incompability with django 1.4
-                raise
+            return self.connection.commit()
